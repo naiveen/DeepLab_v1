@@ -3,11 +3,12 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.models as models
 import torchvision.transforms.functional as F
+from tqdm import tqdm
 
 import itertools, utils
 import numpy as np
 from PIL import Image
-
+from tqdm import tqdm
 import pydensecrf.densecrf as dcrf
 import pydensecrf.utils
 
@@ -21,7 +22,7 @@ class DeepLab_v1():
         torch.cuda.set_device(self.gpu)
 
         self.model = VGG16_LargeFOV(self.num_classes, init_weights=False).cuda(self.gpu)
-        self.model.load_state_dict(torch.load(weight_file))
+        self.model.load_state_dict(torch.load(weight_file,map_location='cuda:0'))
         
         self.mean = torch.Tensor([0.485, 0.456, 0.406]).view(-1, 1, 1).cuda(self.gpu, non_blocking=True)
         self.std = torch.Tensor([0.229, 0.224, 0.225]).view(-1, 1, 1).cuda(self.gpu, non_blocking=True)
@@ -41,9 +42,9 @@ class DeepLab_v1():
                 
                 crf = DenseCRF(iter_max, bi_w, bi_xy_std, bi_rgb_std, pos_w, pos_xy_std)
                 
-                for i, (image, y) in enumerate(data):
+                for iter, (image, y) in enumerate(data):
                     
-                    if i == 100: break
+                    if iter == 200: break
                         
                     n, c, h, w = y.shape
                     y = y.view(n, h, w).type(torch.LongTensor)
@@ -85,10 +86,10 @@ class DeepLab_v1():
                 else:
                     print(state)
                     
-    def inference(self, image_dir, iter_max, bi_w, bi_xy_std, bi_rgb_std, pos_w, pos_xy_std):
+    def inference(self, image_path, model_type, iter_max, bi_w, bi_xy_std, bi_rgb_std, pos_w, pos_xy_std):
         self.model.eval()
         with torch.no_grad():
-            image = Image.open(image_dir).convert('RGB')
+            image = Image.open(image_path).convert('RGB')
             
             image_tensor = torch.as_tensor(np.asarray(image))
             image_tensor = image_tensor.view(image.size[1], image.size[0], len(image.getbands()))
@@ -100,15 +101,50 @@ class DeepLab_v1():
             image_norm_tensor = image_norm_tensor.sub_(self.mean).div_(self.std)
             
             output = self.model(image_norm_tensor)
+
             output = F.resize(output, (h, w), Image.BILINEAR)
             output = nn.Softmax2d()(output)
             output = output[0]
-            
-            crf = DenseCRF(iter_max, bi_w, bi_xy_std, bi_rgb_std, pos_w, pos_xy_std)
-            
-            predict = crf(image_tensor, output)
-            predict = np.argmax(predict, axis=0)
-            return predict
+
+            probs_ = torch.argmax(output, dim=0) 
+            cnn_label_array = np.array(probs_.cpu(), dtype=np.uint8)
+            cnn_img_label = Image.fromarray(cnn_label_array)
+            cnn_probmap = output.detach().cpu().numpy()
+
+            if(model_type=="CRF"):
+                cnn_probmap = output.detach().cpu().numpy()
+                crf = model.DenseCRF(iter_max, bi_w, bi_xy_std, bi_rgb_std, pos_w, pos_xy_std)
+                crf_probmap = crf(image_tensor, output)
+                crf_label_array = np.argmax(crf_probmap, axis=0)
+                crf_label_array = np.array(crf_label_array, dtype=np.uint8)
+                crf_img_label = Image.fromarray(crf_label_array)
+                return crf_img_label, crf_probmap
+            return cnn_img_label, cnn_probmap
+
+    def eval(self, data):
+        tps = torch.zeros(self.num_classes).cuda(self.gpu, non_blocking=True)
+        fps = torch.zeros(self.num_classes).cuda(self.gpu, non_blocking=True)
+        fns = torch.zeros(self.num_classes).cuda(self.gpu, non_blocking=True)
+        for iter, image_path  in tqdm(enumerate(dataset.images)):
+            label_path = image_path.replace("JPEGImages","SegmentationClass")
+            label_path = label_path.replace("jpg","png")
+            label = class2label(label_path)
+            img_label,probmap = inference(DeepLab_v1,image_path,"CNN" ,iter_max=iter_max, 
+                                      bi_w=bi_w, bi_xy_std=bi_xy_std, bi_rgb_std=bi_rgb_std, 
+                                      pos_w=pos_w, pos_xy_std=pos_xy_std)
+            predict = torch.from_numpy(probmap).float().cuda(0, non_blocking=True)
+            predict = torch.argmax(predict, dim=0)
+            label  = torch.from_numpy(label).cuda(0,non_blocking=True)
+            filter_255 = label!=255
+
+            for i in range(21):
+              positive_i = predict==i
+              true_i = label==i
+              tps[i] += torch.sum(positive_i & true_i)
+              fps[i] += torch.sum(positive_i & ~true_i & filter_255)
+              fns[i] += torch.sum(~positive_i & true_i)
+        mIoU = torch.sum(tps / (self.eps + tps + fps + fns)) / self.num_classes
+        print("mIoU:{}".format(100*mIoU))
 
     
 def make_layers():
